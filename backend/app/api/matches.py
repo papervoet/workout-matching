@@ -15,26 +15,21 @@ router = APIRouter(prefix="/matches", tags=["matches"])
 
 
 # -------------------------------
-# 임시 유저(작성자) 의존성
+# X-User-Id header or default user fallback
 # -------------------------------
-def get_current_user_id(x_user_id: Optional[int] = Header(default=1)):
+def get_current_user_id(x_user_id: Optional[int] = Header(default=None)) -> int:
     """
-    개발 단계용 임시 로그인.
-
-    - 실제 서비스에서는 Firebase 등에서 user_id를 추출해야 함.
-    - 지금은 X-User-Id 헤더가 오면 그 값을 쓰고,
-      안 오면 기본값으로 1번 유저로 간주.
+    Temporary auth shim.
+    - If X-User-Id header is provided, use it
+    - Otherwise fall back to user 1
     """
-    if x_user_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="X-User-Id header required in dev mode.",
-        )
-    return x_user_id
+    if x_user_id is not None:
+        return x_user_id
+    return 1
 
 
 # -------------------------------
-# 1. 매칭 생성 - POST /matches/
+# 1. Create match - POST /matches/
 # -------------------------------
 @router.post("/", response_model=Match, status_code=status.HTTP_201_CREATED)
 def create_match(
@@ -49,9 +44,9 @@ def create_match(
 
     db_match = MatchModel(
         **data,
-        owner_id=current_user_id,  # 작성자
-        status="OPEN",             # 기본 상태
-        current_people=0,          # 초기 인원
+        owner_id=current_user_id,  # creator
+        status="OPEN",             # default status
+        current_people=0,          # initial people
     )
     db.add(db_match)
     db.commit()
@@ -60,7 +55,7 @@ def create_match(
 
 
 # -------------------------------
-# 2. 매칭 리스트 조회 - GET /matches/
+# 2. List matches - GET /matches/
 # -------------------------------
 @router.get("/", response_model=List[Match])
 def list_matches(
@@ -70,14 +65,18 @@ def list_matches(
     to_date: Optional[date] = None,
     sport: Optional[str] = None,
     only_open: bool = True,
+    sido: Optional[str] = None,    # city/province
+    gungu: Optional[str] = None,   # district/county
+    dong: Optional[str] = None,    # neighborhood
 ):
     """
-    매칭 리스트 조회 + 필터
+    List matches with optional filters
 
-    - ?date_param=2025-11-30 : 해당 날짜만
-    - ?from_date=...&to_date=... : 기간 필터
-    - ?sport=농구 : 종목 필터
-    - ?only_open=true : OPEN 상태만
+    - ?date_param=2025-11-30 : specific date
+    - ?from_date=...&to_date=... : date range filter
+    - ?sport=football : sport filter
+    - ?only_open=true : only OPEN status
+    - ?sido=...&gungu=...&dong=... : location prefix filter (partial string)
     """
     query = db.query(MatchModel)
 
@@ -95,12 +94,26 @@ def list_matches(
         if to_date:
             query = query.filter(MatchModel.date <= to_date)
 
+    # Location prefix filter (sido/gungu/dong)
+    if sido or gungu or dong:
+        parts: List[str] = []
+        if sido:
+            parts.append(sido.strip())
+        if gungu:
+            parts.append(gungu.strip())
+        if dong:
+            parts.append(dong.strip())
+
+        prefix = " ".join(parts)
+        like_pattern = f"{prefix}%"
+        query = query.filter(MatchModel.location.ilike(like_pattern))
+
     query = query.order_by(MatchModel.date, MatchModel.start_time, MatchModel.id)
     return query.all()
 
 
 # -------------------------------
-# 3. 단일 매칭 조회 - GET /matches/{match_id}
+# 3. Get a match - GET /matches/{match_id}
 # -------------------------------
 @router.get("/{match_id}", response_model=Match)
 def get_match(
@@ -114,7 +127,7 @@ def get_match(
 
 
 # -------------------------------
-# 4. 매칭 수정 - PUT /matches/{match_id}
+# 4. Update match - PUT /matches/{match_id}
 # -------------------------------
 @router.put("/{match_id}", response_model=Match)
 def update_match(
@@ -144,7 +157,7 @@ def update_match(
 
 
 # -------------------------------
-# 5. 매칭 삭제 - DELETE /matches/{match_id}
+# 5. Delete match - DELETE /matches/{match_id}
 # -------------------------------
 @router.delete("/{match_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_match(
@@ -165,7 +178,7 @@ def delete_match(
 
 
 # -------------------------------
-# 6. 매칭 취소 - POST /matches/{match_id}/cancel
+# 6. Cancel match - POST /matches/{match_id}/cancel
 # -------------------------------
 @router.post("/{match_id}/cancel", response_model=Match)
 def cancel_match(
@@ -190,7 +203,7 @@ def cancel_match(
 
 
 # -------------------------------
-# 7. 매칭 참여 - POST /matches/{match_id}/join
+# 7. Join match - POST /matches/{match_id}/join
 # -------------------------------
 @router.post("/{match_id}/join", response_model=Match)
 def join_match(
@@ -198,20 +211,20 @@ def join_match(
     db: Session = Depends(get_db),
     current_user_id: int = Depends(get_current_user_id),
 ):
-    # 매칭 존재 확인
+    # Ensure match exists
     match = db.query(MatchModel).filter(MatchModel.id == match_id).first()
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    # 상태 체크
+    # Status check
     if match.status != "OPEN":
         raise HTTPException(status_code=400, detail="Match is not open for joining.")
 
-    # 인원 초과 체크
+    # Capacity check
     if match.current_people >= match.max_people:
         raise HTTPException(status_code=400, detail="Match is full.")
 
-    # 이미 참여중인지 체크 (JOINED 상태)
+    # Already joined?
     existing = (
         db.query(ParticipationModel)
         .filter(
@@ -224,7 +237,6 @@ def join_match(
     if existing:
         raise HTTPException(status_code=400, detail="Already joined this match.")
 
-    # Participation 생성
     participation = ParticipationModel(
         match_id=match_id,
         user_id=current_user_id,
@@ -232,7 +244,6 @@ def join_match(
     )
     db.add(participation)
 
-    # 현재 인원 +1
     match.current_people += 1
 
     db.commit()
@@ -241,7 +252,7 @@ def join_match(
 
 
 # -------------------------------
-# 8. 매칭 참여 취소 - POST /matches/{match_id}/leave
+# 8. Leave match - POST /matches/{match_id}/leave
 # -------------------------------
 @router.post("/{match_id}/leave", response_model=Match)
 def leave_match(
@@ -253,7 +264,6 @@ def leave_match(
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    # 지금 JOINED 상태의 Participation 찾기
     participation = (
         db.query(ParticipationModel)
         .filter(
@@ -267,10 +277,8 @@ def leave_match(
     if not participation:
         raise HTTPException(status_code=400, detail="You are not joined in this match.")
 
-    # 상태 변경 (soft cancel)
     participation.status = "CANCELLED"
 
-    # 현재 인원 -1 (0 아래로는 안내려가게)
     if match.current_people > 0:
         match.current_people -= 1
 
@@ -280,7 +288,7 @@ def leave_match(
 
 
 # -------------------------------
-# 9. 특정 월 매칭 조회 - GET /matches/month/{year}/{month}
+# 9. Monthly matches - GET /matches/month/{year}/{month}
 # -------------------------------
 @router.get("/month/{year}/{month}", response_model=List[Match])
 def list_matches_by_month(
@@ -307,3 +315,60 @@ def list_matches_by_month(
     query = query.order_by(MatchModel.date, MatchModel.start_time, MatchModel.id)
     return query.all()
 
+
+# -------------------------------
+# 10. My created matches - GET /matches/my/created
+# -------------------------------
+@router.get("/my/created", response_model=List[Match])
+def list_my_created_matches(
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
+    only_open: bool = True,
+):
+    """
+    Matches I created
+    - only_open=True: only OPEN status
+    """
+
+    query = db.query(MatchModel).filter(
+        MatchModel.owner_id == current_user_id
+    )
+
+    if only_open:
+        query = query.filter(MatchModel.status == "OPEN")
+
+    query = query.order_by(MatchModel.date, MatchModel.start_time, MatchModel.id)
+    return query.all()
+
+
+# -------------------------------
+# 11. My joined matches - GET /matches/my/joined
+# -------------------------------
+@router.get("/my/joined", response_model=List[Match])
+def list_my_joined_matches(
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user_id),
+    only_open: bool = True,
+):
+    """
+    Matches I joined (Participation.status == 'JOINED')
+    - only_open=True: only OPEN matches
+    """
+
+    query = (
+        db.query(MatchModel)
+        .join(
+            ParticipationModel,
+            ParticipationModel.match_id == MatchModel.id,
+        )
+        .filter(
+            ParticipationModel.user_id == current_user_id,
+            ParticipationModel.status == "JOINED",
+        )
+    )
+
+    if only_open:
+        query = query.filter(MatchModel.status == "OPEN")
+
+    query = query.order_by(MatchModel.date, MatchModel.start_time, MatchModel.id)
+    return query.all()
